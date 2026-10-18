@@ -24,6 +24,7 @@ WATCHDOG_RESTART_LABEL="${WATCHDOG_RESTART_LABEL:-watchdog.restart}"
 WATCHDOG_STATE_DIR="${WATCHDOG_STATE_DIR:-/etc/watchdog/states}"
 
 NTFY_SEND="${NTFY_SEND:-/usr/bin/ntfy-send}"
+NTFY_ENV_FILE="${NTFY_ENV_FILE:-/etc/ntfy-send/.env}"
 NTFY_TOPIC="${NTFY_TOPIC:-docker-monitoring}"
 NTFY_PRIORITY="${NTFY_PRIORITY:-4}"
 NTFY_TAGS="${NTFY_TAGS:-warning}"
@@ -40,39 +41,86 @@ log() {
 }
 
 notify() {
-  local message="$1"
-  local priority="${2:-$NTFY_PRIORITY}"
-  local tags="${3:-$NTFY_TAGS}"
+  local title="$1"
+  local message="$2"
+  local priority="${3:-$NTFY_PRIORITY}"
+  local tags="${4:-$NTFY_TAGS}"
+  local topic="${NTFY_TOPIC:-}"
 
-  if [[ ! -x "$NTFY_SEND" ]]; then
-    log "ERROR: ntfy-send is not executable: $NTFY_SEND"
+  if [[ -n "$NTFY_SEND" && -x "$NTFY_SEND" ]]; then
+    if "$NTFY_SEND" \
+      "DEFAULT" \
+      "$title" \
+      "$message" \
+      "--topic=$topic" \
+      "--prio=$priority" \
+      "--tags=$tags" >/dev/null 2>&1; then
+      return 0
+    else
+      local result=$?
+      log "ERROR: ntfy-send failed with exit code $result."
+      return "$result"
+    fi
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    log "ERROR: ntfy-send is unavailable and curl is not installed."
     return 1
   fi
 
-  if "$NTFY_SEND" "$message" \
-    "--topic=$NTFY_TOPIC" \
-    "--prio=$priority" \
-    "--tags=$tags" >/dev/null 2>&1; then
+  if [[ ! -f "$NTFY_ENV_FILE" ]]; then
+    log "ERROR: ntfy configuration file not found: $NTFY_ENV_FILE"
+    return 1
+  fi
+
+  local SERVER TOKEN DEFAULT_TOPIC
+  SERVER=""
+  TOKEN=""
+  DEFAULT_TOPIC=""
+
+  set -a
+  source "$NTFY_ENV_FILE"
+  set +a
+
+  topic="${topic:-$DEFAULT_TOPIC}"
+
+  if [[ -z "$SERVER" || -z "$TOKEN" || -z "$topic" ]]; then
+    log "ERROR: ntfy SERVER, TOKEN or topic is missing."
+    return 1
+  fi
+
+  local -a curl_headers=(
+    -H "Authorization: Bearer $TOKEN"
+    -H "Title: $title"
+    -H "X-Priority: $priority"
+    -H "X-Tags: $tags"
+  )
+
+  if curl --fail --silent --show-error \
+    --output /dev/null \
+    "${curl_headers[@]}" \
+    --data-binary "$message" \
+    "${SERVER%/}/$topic"; then
     return 0
   else
     local result=$?
-    log "ERROR: Notification failed with exit code $result"
+    log "ERROR: curl notification failed with exit code $result."
     return "$result"
   fi
 }
 
 if ! command -v docker >/dev/null 2>&1; then
-  log "ERROR: Docker command not found."
+  echo "ERROR: Docker command not found." >&2
   exit 1
 fi
 
 if ! command -v flock >/dev/null 2>&1; then
-  log "ERROR: flock command not found."
+  echo "ERROR: flock command not found." >&2
   exit 1
 fi
 
 if ! command -v date >/dev/null 2>&1; then
-  log "ERROR: date command not found."
+  echo "ERROR: date command not found." >&2
   exit 1
 fi
 
@@ -203,7 +251,8 @@ else
         log "ALERT: $name is down."
 
         notify \
-          "Docker alert: $name is DOWN on $(hostname)." \
+          "Docker Alert: $name" \
+          "Container $name is DOWN on $(hostname)." \
           "$NTFY_PRIORITY" \
           "$NTFY_TAGS" || true
 
@@ -226,7 +275,8 @@ else
               log "RECOVERED: $name is running again."
 
               notify \
-                "Docker recovery: $name is UP again on $(hostname)." \
+                "Docker Recovery: $name" \
+                "Container $name is UP again on $(hostname)." \
                 "3" \
                 "white_check_mark" || true
 
@@ -264,7 +314,8 @@ else
         log "RECOVERED: $name is running again."
 
         notify \
-          "Docker recovery: $name is UP again on $(hostname)." \
+          "Docker Recovery: $name" \
+          "Container $name is UP again on $(hostname)." \
           "3" \
           "white_check_mark" || true
       elif [[ -z "$previous" ]]; then
@@ -293,15 +344,19 @@ fi
 if [[ "$REPORT_HOUR" -ge 2000 && "$LAST_REPORT_DATE" != "$REPORT_DATE" ]]; then
   log "Sending daily status report."
 
-  REPORT_MESSAGE="Daily Docker Watchdog Report
-Server: $(hostname)
+  REPORT_MESSAGE="Server: $(hostname)
 Date: $REPORT_DATE
 Monitored: $((UP_COUNT + DOWN_COUNT + UNKNOWN_COUNT))
 Running: $UP_COUNT
 Down: $DOWN_COUNT
 Unknown or starting: $UNKNOWN_COUNT"
 
-  if notify "$REPORT_MESSAGE" "3" "white_check_mark"; then
+  if notify \
+    "[Watchdog] Daily docker report" \
+    "$REPORT_MESSAGE" \
+    "3" \
+    "white_check_mark,calendar"; then
+
     REPORT_TEMP="${REPORT_STATE_FILE}.tmp.$$"
 
     if printf '%s\n' "$REPORT_DATE" > "$REPORT_TEMP" &&
